@@ -22,6 +22,6 @@
   "lighthouseTargetManagementGroupID": "612e3f19-36e9-44c6-a7f0-9daa3a334fb9",
   "securityRetentionDays": "730",
   "cloudUsageProfiles": "[3,6]",
-  "enableMultiCloudProfiles": "false",
+  "enableMultiCloudProfiles": true,
   "tenantId": "612e3f19-36e9-44c6-a7f0-9daa3a334fb9"
 }
