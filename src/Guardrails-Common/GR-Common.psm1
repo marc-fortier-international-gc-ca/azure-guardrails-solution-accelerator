@@ -263,7 +263,10 @@ Function Add-TenantInfo {
         $cloudUsageProfiles,
         [Parameter(Mandatory = $true)]
         [string]
-        $tenantName
+        $tenantName,
+        [Parameter(Mandatory = $true)]
+        [string]
+        $locale
     )
     $tenantInfo = Get-GSAAutomationVariable("tenantDomainUPN")
 
@@ -275,6 +278,7 @@ Function Add-TenantInfo {
         DepartmentName     = $DepartmentName
         DepartmentNumber   = $DepartmentNumber
         cloudUsageProfiles = $cloudUsageProfiles
+        Locale             = $locale
     }
     if ($debug) { Write-Output $tenantInfo }
     $JSON = ConvertTo-Json -inputObject $object
@@ -516,8 +520,10 @@ function Check-UpdateAvailable {
     {
         $updateNeeded=$true
     }
-    elseif(($deployedVersionVersion -eq $currentVersionVersion) -and ($deployedVersion -match 'beta')){
-        $updateNeeded=$true
+    elseif(($deployedVersionVersion -eq $currentVersionVersion) -and 
+        ($deployedVersion -match 'beta') -and 
+        ($currentVersion -notmatch 'beta')) {
+        $updateNeeded = $true
     }
     else {
         $updateNeeded = $false
@@ -568,6 +574,7 @@ function get-itsgdata {
         -logType $LogType `
         -TimeStampField Get-Date
 }
+
 function New-LogAnalyticsData {
     [CmdletBinding()]
     param (
@@ -769,6 +776,229 @@ function Parse-BlobContent {
 
     return $result
 }
+# New improves version of Invoke-GraphQuery function that handles paging and retries
+# This function is designed to be used with the Microsoft Graph API and will automatically handle pagination
+
+function Invoke-GraphQueryEX {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern('^(?!https://graph.microsoft.com/(v1|beta)/)')]
+        [string]
+        $urlPath,
+        [int]$MaxRetries = 3,
+        [int]$RetryDelaySeconds = 5
+    )
+
+    [string]$baseUri = "https://graph.microsoft.com/v1.0"
+    $fullUri = "$baseUri$urlPath" 
+    $allResults = @()
+    $statusCode = $null
+    $pageCount = 0
+   # Write-Host $fullUri
+    do {
+        $retryCount = 0
+        $success = $false
+        $pageCount++
+        Write-Progress -Activity "Invoke-GraphQueryEX" -Status "Retrieving page $pageCount..."
+        
+        do {
+            try {
+                $uri = $fullUri -as [uri]
+                $response = Invoke-AZRestMethod  -Uri $uri  -Method GET -ErrorAction Stop 
+                $data = $response.Content | ConvertFrom-Json
+                $parsedcontent = $data.value
+                $statusCode = $response.StatusCode
+                $success = $true
+            }
+            catch {
+                $retryCount++
+                if ($retryCount -ge $MaxRetries) {
+                    Write-Error "Failed to call Microsoft Graph REST API at URL '$fullUri' after $MaxRetries attempts; error: $($_.Exception.Message) at page $pageCount"
+                    Write-Progress -Activity "Invoke-GraphQueryEX" -Status "Failed" -Completed
+                    return @{
+                        Content    = $null
+                        StatusCode = $null
+                        Error      = $_.Exception.Message
+                    }
+                } else {
+                    Write-Warning "Transient error calling Graph API: $($_.Exception.Message). Retrying in $RetryDelaySeconds seconds... (Attempt $retryCount of $MaxRetries)"
+                    Start-Sleep -Seconds $RetryDelaySeconds
+                }
+            }
+        } while (-not $success -and $retryCount -lt $MaxRetries)
+
+        if ($null -ne $data.value) {
+            $allResults += $data.value
+        } else {
+            # For endpoints that don't return .value (single object)
+            $allResults = $data
+            break
+        }
+        # Handle paging
+        if ($data.'@odata.nextLink') {
+            $fullUri = $data.'@odata.nextLink'
+        } else {
+            $fullUri = $null
+        }
+    } while ($fullUri)
+    
+    Write-Progress -Activity "Invoke-GraphQueryEX" -Status "Completed" -Completed
+
+    return @{
+        Content    = @{ value = $allResults }
+        StatusCode = $statusCode
+    }
+}
+# end of Invoke-GraphQueryEX function
+
+# Function for true streaming Graph API queries with callback processing
+function Invoke-GraphQueryStreamWithCallback {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern('^(?!https://graph.microsoft.com/(v1|beta)/)')]
+        [string] $urlPath,
+        
+        [Parameter(Mandatory = $true)]
+        [scriptblock] $ProcessPageCallback,
+        
+        [Parameter(Mandatory = $false)]
+        [hashtable] $CallbackContext = @{},
+        
+        [Parameter(Mandatory = $false)]
+        [int] $PageSize = 999,
+        
+        [Parameter(Mandatory = $false)]
+        [int] $MaxRetries = 3,
+        
+        [Parameter(Mandatory = $false)]
+        [int] $RetryDelaySeconds = 5,
+        
+        [Parameter(Mandatory = $false)]
+        [hashtable] $PerformanceMetrics = $null
+    )
+
+    [string] $baseUri = "https://graph.microsoft.com/v1.0"
+    
+    # Add $top parameter if not already present
+    if ($urlPath -notmatch '\$top=') {
+        $separator = if ($urlPath -match '\?') { '&' } else { '?' }
+        $urlPath = "$urlPath$separator`$top=$PageSize"
+    }
+
+    
+    $fullUri = "$baseUri$urlPath"
+    $pageCount = 0
+    $totalProcessed = 0
+    $totalUploaded = 0
+        
+    do {
+        $pageCount++
+        $retryCount = 0
+        $success = $false
+        
+        Write-Verbose "  -> Fetching page $pageCount from Graph API..."        
+        do {
+            try {
+                $uri = $fullUri -as [uri]
+                $response = Invoke-AzRestMethod -Uri $uri -Method GET -ErrorAction Stop
+                $statusCode = $response.StatusCode
+                                
+                # Check for successful status codes (200-299)
+                if ($statusCode -ge 200 -and $statusCode -lt 300) {
+                    $data = $response.Content | ConvertFrom-Json
+                    $success = $true
+                                        
+                    # Update performance metrics if provided
+                    if ($PerformanceMetrics) {
+                        $PerformanceMetrics.GraphApiCalls++
+                    }
+                } else {
+                    # Handle non-success status codes
+                    $errorContent = $response.Content
+
+                    # Determine if this is a retryable error
+                    $isRetryable = switch ($statusCode) {
+                        429 { $true }   # Too Many Requests - always retry
+                        500 { $true }   # Internal Server Error - retry
+                        502 { $true }   # Bad Gateway - retry  
+                        503 { $true }   # Service Unavailable - retry
+                        504 { $true }   # Gateway Timeout - retry
+                        400 { $false }  # Bad Request - don't retry (client error)
+                        401 { $false }  # Unauthorized - don't retry (auth error)
+                        403 { $false }  # Forbidden - don't retry (permission error)
+                        404 { $false }  # Not Found - don't retry (resource error)
+                        default { $statusCode -ge 500 }  # Retry on 5xx errors, not 4xx
+                    }
+                    
+                    if (-not $isRetryable) {
+                        throw [System.Exception]::new("Graph API returned non-retryable error $statusCode at page $pageCount. Content: $errorContent")
+                    } else {
+                        throw [System.Exception]::new("Graph API returned retryable error $statusCode at page $pageCount. Content: $errorContent")
+                    }
+                }
+                
+            }
+            catch {
+                $retryCount++
+                $errorMessage = $_.Exception.Message
+                                
+                if ($retryCount -ge $MaxRetries) {
+                    Write-Error "Failed to call Microsoft Graph REST API at URL '$fullUri' after $MaxRetries attempts; error: $errorMessage at page $pageCount"
+                    throw [System.Exception]::new("Failed to call Microsoft Graph REST API at URL '$fullUri' after $MaxRetries attempts; error: $errorMessage at page $pageCount")
+                } elseif ($isRetryable) {
+                    Write-Warning "Retryable error calling Graph API (attempt $retryCount/$MaxRetries): $errorMessage. Retrying in $RetryDelaySeconds seconds..."
+                    Start-Sleep -Seconds $RetryDelaySeconds
+                } else {
+                    Write-Error "Non-retryable error calling Graph API: $errorMessage"
+                    throw [System.Exception]::new("Non-retryable error calling Graph API: $errorMessage")
+                }
+            }
+        } while (-not $success -and $retryCount -lt $MaxRetries)
+
+        # Process current page immediately via callback
+        $pageData = @{
+            Data = if ($null -ne $data.value) { $data.value } else { $data }
+            PageNumber = $pageCount
+            HasMore = $null -ne $data.'@odata.nextLink'
+            StatusCode = $statusCode
+        }
+        
+        # Execute callback to process this page immediately with error handling
+        try {
+            $callbackResult = & $ProcessPageCallback $pageData $CallbackContext
+            if ($callbackResult) {
+                $totalProcessed += $callbackResult.ProcessedCount
+                $totalUploaded += $callbackResult.UploadedCount
+            }
+        }
+        catch {
+            Write-Error "Failed to process page $pageCount via callback: $($_.Exception.Message)"
+            throw $_  # Re-throw to stop processing if callback fails
+        }
+        
+        # Update URI for next page
+        if ($data.'@odata.nextLink') {
+            $fullUri = $data.'@odata.nextLink'
+        } else {
+            $fullUri = $null
+        }
+        
+        # Rate limiting between pages
+        if ($fullUri) {
+            Write-Verbose "  -> Waiting 2 seconds before fetching next page..."
+            Start-Sleep -Seconds 2
+        }
+        
+    } while ($fullUri)
+    
+    return @{
+        TotalPages = $pageCount
+        TotalProcessed = $totalProcessed
+        TotalUploaded = $totalUploaded
+    }
+}
 
 function Invoke-GraphQuery {
     [CmdletBinding()]
@@ -793,6 +1023,110 @@ function Invoke-GraphQuery {
     @{
         Content    = $response.Content | ConvertFrom-Json
         StatusCode = $response.StatusCode
+    }
+}
+
+# Utility function for centralized error handling
+function Add-FunctionError {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Message,
+        
+        [Parameter(Mandatory = $false)]
+        [System.Exception] $Exception = $null,
+        
+        [Parameter(Mandatory = $false)]
+        [string] $Category = "General",
+        
+        [Parameter(Mandatory = $false)]
+        [System.Collections.Generic.List[string]] $ErrorList = $null
+    )
+    
+    if ($Exception) {
+        $errorMsg = "$Category - $Message : $($Exception.Message)"
+    } else {
+        $errorMsg = "$Category - $Message"
+    }
+    
+    Write-Warning $errorMsg
+    
+    if ($ErrorList) {
+        $ErrorList.Add($errorMsg)
+    }
+}
+
+# Utility function for exponential backoff delay calculation
+function Get-BackoffDelay {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [int] $Attempt,
+        
+        [Parameter(Mandatory = $true)]
+        [hashtable] $Config
+    )
+    
+    $delay = [Math]::Min(
+        $Config.BaseDelay * [Math]::Pow($Config.BackoffMultiplier, $Attempt - 1),
+        $Config.MaxDelay
+    )
+    return [int]$delay
+}
+
+# Utility function for Graph API calls with metrics and error handling
+function Invoke-GraphQueryWithMetrics {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $UrlPath,
+        
+        [Parameter(Mandatory = $false)]
+        [string] $Operation = "Graph API Call",
+        
+        [Parameter(Mandatory = $false)]
+        [hashtable] $PerformanceMetrics = $null,
+        
+        [Parameter(Mandatory = $false)]
+        [int] $MaxRetries = 5,
+        
+        [Parameter(Mandatory = $false)]
+        [int] $RetryDelaySeconds = 10
+    )
+    
+    Write-Verbose "  -> $Operation : $UrlPath"
+    
+    try {
+        # Use the existing retry logic in Invoke-GraphQueryEX
+        $response = Invoke-GraphQueryEX -urlPath $UrlPath -MaxRetries $MaxRetries -RetryDelaySeconds $RetryDelaySeconds -ErrorAction Stop
+        
+        # Update performance metrics if provided
+        if ($PerformanceMetrics) {
+            $PerformanceMetrics.GraphApiCalls++
+        }
+        
+        # Handle array responses consistently
+        if ($response -is [System.Array]) {
+            $response = $response | Where-Object { 
+                $null -ne $_.Content -or $null -ne $_.StatusCode 
+            } | Select-Object -Last 1
+        }
+        
+        # Check for successful response
+        if ($response.Error) {
+            throw [System.Exception]::new("Graph API error: $($response.Error)")
+        }
+        
+        if (-not $response.StatusCode -or $response.StatusCode -lt 200 -or $response.StatusCode -ge 300) {
+            throw [System.Exception]::new("Graph API returned status code: $($response.StatusCode)")
+        }
+        
+        Write-Verbose "  Success: $Operation completed"
+        return $response
+    }
+    catch {
+        Write-Error "$Operation failed: $($_.Exception.Message)"
+        throw $_
     }
 }
 
@@ -1044,7 +1378,116 @@ function Get-AllUserAuthInformation {
     return $PsObject
 
 }
+function Get-AllUserAuthInformationEX {
+    <#
+    .SYNOPSIS
+    Optimized version of Get-AllUserAuthInformation using Microsoft Graph Batch API for improved performance.
+    Compatible with PowerShell 5.1. Signature and output format are unchanged.
 
+    .PARAMETER allUserList
+    Array of user objects to check for MFA status.
+
+    .OUTPUTS
+    PSCustomObject with userUPNsBadMFA, ErrorList, userValidMFACounter, userUPNsValidMFA.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [array]$allUserList
+    )
+
+    # Initialize output containers
+    [PSCustomObject] $ErrorList = New-Object System.Collections.ArrayList
+    $userValidMFACounter = 0
+    $userUPNsValidMFA = @()
+    $userUPNsBadMFA = @()
+    $batchSize = 20
+    $pattern = "*#EXT#*"
+
+    # Process users in batches of 20 (Graph Batch API limit)
+    for ($i = 0; $i -lt $allUserList.Count; $i += $batchSize) {
+        $batchUsers = $allUserList[$i..([Math]::Min($i+$batchSize-1, $allUserList.Count-1))]
+        $batchRequests = @()
+        $userMap = @{}
+
+        # Build batch request payload for each user in the batch
+        $reqId = 1
+        foreach ($user in $batchUsers) {
+            $userAccount = $user.userPrincipalName
+            if ($userAccount -like $pattern) {
+                # Guest accounts
+                $userEmail = $user.mail
+                if ($null -ne $userEmail) {
+                    $urlPath = "/users/$userEmail/authentication/methods"
+                } else {
+                    $extractedEmail = (($userAccount -split '#')[0]) -replace '_', '@'
+                    $urlPath = "/users/$extractedEmail/authentication/methods"
+                }
+            } else {
+                # Member accounts
+                $urlPath = "/users/$userAccount/authentication/methods"
+            }
+            $batchRequests += @{
+                id     = "$reqId"
+                method = "GET"
+                url    = $urlPath
+            }
+            $userMap["$reqId"] = $userAccount
+            $reqId++
+        }
+
+        # Convert batch request to JSON
+        $batchPayload = @{ requests = $batchRequests } | ConvertTo-Json -Depth 4
+
+        # Send batch request to Graph API
+        try {
+            $response = Invoke-AzRestMethod -Uri "https://graph.microsoft.com/v1.0/\$batch" -Method POST -Body $batchPayload -ErrorAction Stop
+            $batchResults = ($response.Content | ConvertFrom-Json).responses
+        }
+        catch {
+            $ErrorList.Add("Batch request failed: $_")
+            continue
+        }
+
+        # Process each response in the batch
+        foreach ($result in $batchResults) {
+            $userAccount = $userMap[$result.id]
+            if ($result.status -eq 200 -and $null -ne $result.body.value) {
+                $authFound = $false
+                foreach ($authmeth in $result.body.value) {
+                    switch ($authmeth.'@odata.type') {
+                        "#microsoft.graph.phoneAuthenticationMethod" { $authFound = $true; break }
+                        "#microsoft.graph.microsoftAuthenticatorAuthenticationMethod" { $authFound = $true; break }
+                        "#microsoft.graph.fido2AuthenticationMethod" { $authFound = $true; break }
+                        "#microsoft.graph.temporaryAccessPassAuthenticationMethod" { $authFound = $true; break }
+                        "#microsoft.graph.windowsHelloForBusinessAuthenticationMethod" { $authFound = $true; break }
+                        "#microsoft.graph.softwareOathAuthenticationMethod" { $authFound = $true; break }
+                    }
+                }
+                if ($authFound) {
+                    $userValidMFACounter += 1
+                    $userValidUPNtemplate = [PSCustomObject]@{ UPN = $userAccount; MFAStatus = $true }
+                    $userUPNsValidMFA += $userValidUPNtemplate
+                } else {
+                    $userUPNtemplate = [PSCustomObject]@{ UPN = $userAccount; MFAStatus = $false }
+                    $userUPNsBadMFA += $userUPNtemplate
+                }
+            } else {
+                $ErrorList.Add("No authentication methods data for $userAccount or error status: $($result.status)")
+                $userUPNtemplate = [PSCustomObject]@{ UPN = $userAccount; MFAStatus = $false }
+                $userUPNsBadMFA += $userUPNtemplate
+            }
+        }
+    }
+
+    # Return results in the same format as the original function
+    $PsObject = [PSCustomObject]@{
+        userUPNsBadMFA      = $userUPNsBadMFA
+        ErrorList           = $ErrorList
+        userValidMFACounter = $userValidMFACounter
+        userUPNsValidMFA    = $userUPNsValidMFA
+    }
+}
 function CompareKQLQueries{
     param (
         [string] $query,
@@ -1274,7 +1717,7 @@ function Check-PBMMPolicies {
                 # All 3 required policies are applied
                 $Comment += ' ' + $msgTable.reqPolicyApplied
 
-                # PBMM is applied and not excluded. Testing if specific policies haven't been excluded.
+                # PBMM is applied and not excluded. Testing if specific policies haven't been exempted.
                 $policyExemptionList = Test-PolicyExemptionExists -ScopeId $tempId -requiredPolicyExemptionIds $requiredPolicyExemptionIds
 
                 $exemptList = $policyExemptionList.exemptionId
@@ -1474,7 +1917,6 @@ function Check-PBMMPolicies {
     return $tempObjectList
 }
 
-
 # Used in AlersMonitor and UserAccountGCEventLogging
 function get-AADDiagnosticSettings {
     $apiUrl = "https://management.azure.com/providers/microsoft.aadiam/diagnosticSettings?api-version=2017-04-01-preview"
@@ -1629,7 +2071,7 @@ function Check-BuiltInPolicies {
         [string]$itsgcode,
         [string]$CloudUsageProfiles = "3",
         [string]$ModuleProfiles,
-        [switch]$EnableMultiCloudProfiles,
+                             [switch]$EnableMultiCloudProfiles,
         [System.Collections.ArrayList]$ErrorList
     )
     
@@ -1887,4 +2329,438 @@ function Check-BuiltInPolicies {
     return $results
 }
 
+function FetchAllUserRawData {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [string] $ReportTime,
+        
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [string] $FirstBreakGlassUPN,
+        
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [string] $SecondBreakGlassUPN,
+        
+        [Parameter(Mandatory=$true)]
+        [ValidateScript({
+            try { [System.Guid]::Parse($_); $true }
+            catch { throw "WorkSpaceID must be a valid GUID" }
+        })]
+        [string] $WorkSpaceID,
+        
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [string] $WorkspaceKey,
+        
+        [Parameter()]
+        [int] $BatchSize = 999,
+        
+        [Parameter()]
+        [hashtable] $RetryConfig = @{
+            MaxRetries = 12
+            BaseDelay = 5
+            MaxDelay = 60
+            BackoffMultiplier = 2
+        }
+    )
+    
+    # Initialize error tracking and performance monitoring
+    $ErrorList = [System.Collections.Generic.List[string]]::new()
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $performanceMetrics = @{
+        StartTime = Get-Date
+        GraphApiCalls = 0
+        UsersProcessed = 0
+        DataIngestionAttempts = 0
+    }
+    
+    $startTimeFormatted = $performanceMetrics.StartTime.ToString("yyyy-MM-dd HH:mm:ss")
+    Write-Verbose "=== Starting FetchAllUserRawData with ReportTime: $ReportTime  at $startTimeFormatted ==="
+    Write-Verbose "Step 1: Fetching authentication method registration details..."
+    $regById = @{}
+    
+    try {
+        $regPath = "/reports/authenticationMethods/userRegistrationDetails"
+        $regResponse = Invoke-GraphQueryWithMetrics -UrlPath $regPath -Operation "Fetch Registration Details" -PerformanceMetrics $performanceMetrics
+        $registrationDetails = @($regResponse.Content.value)
+        
+        Write-Verbose "  Success: Retrieved $($registrationDetails.Count) registration records"
+        
+        # Build efficient lookup for registration data
+        $registrationDetails | ForEach-Object {
+            if ($_.id -and -not $regById.ContainsKey($_.id)) {
+                $regById[$_.id] = $_
+            }
+        }
+        Write-Verbose "  Success: Built lookup table for $($regById.Count) registration records"        
+    } catch {
+        Add-FunctionError -Message "Failed to fetch registration details from Microsoft Graph" -Exception $_.Exception -Category "GraphAPI" -ErrorList $ErrorList
+    }
+    
+    # Step 2: Prepare break-glass account filtering
+    Write-Verbose "Step 2: Preparing break-glass account filtering..."
+        $bgUpns = @($FirstBreakGlassUPN, $SecondBreakGlassUPN) | 
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { $_.ToLower() }
+            
+            # Use hashtable for O(1) lookup performance
+            $bgUpnLookup = @{}
+            $bgUpns | ForEach-Object { $bgUpnLookup[$_] = $true }
+            
+    if ($bgUpns.Count -gt 0) {
+        $bgUpnList = $bgUpns -join ', '
+        Write-Verbose "  -> Will filter out break-glass accounts: $bgUpnList"
+    }
+    
+    # Step 3: Setup streaming user processing
+    Write-Verbose "Step 3: Starting streaming user processing..."
+    $selectFields = "displayName,id,userPrincipalName,mail,createdDateTime,userType,accountEnabled,signInActivity"
+    $filterQuery = "accountEnabled eq true"
+    $usersPath = "/users?$" + "select=$selectFields&$" + "filter=$filterQuery"
 
+    # Step 4: True streaming - process and upload users page by page as they're fetched
+    Write-Verbose "Step 4: True streaming user processing with page size $BatchSize..."
+    
+    # Create a context object with all variables needed by the callback
+    $callbackContext = @{
+        WorkSpaceID = $WorkSpaceID
+        WorkspaceKey = $WorkspaceKey
+        ReportTime = $ReportTime
+        bgUpnLookup = $bgUpnLookup
+        regById = $regById
+        RetryConfig = $RetryConfig
+        ErrorList = $ErrorList
+    }
+    
+    # Define the callback function that processes each page immediately
+    $processPageCallback = {
+        param($pageData, $context)
+        
+        $pageNumber = $pageData.PageNumber
+        $pageUsers = $pageData.Data
+        $hasMore = $pageData.HasMore
+        
+        if (-not $pageUsers -or $pageUsers.Count -eq 0) {
+            Write-Verbose "  -> Page $pageNumber : No users returned, skipping..."
+            return @{ ProcessedCount = 0; UploadedCount = 0 }
+        }
+        
+        Write-Verbose "  -> Page $pageNumber : Processing $($pageUsers.Count) users from Graph API..."
+                
+        # Filter out break-glass accounts from this page
+        $filteredPageUsers = $pageUsers | Where-Object { 
+            $upn = $_.userPrincipalName
+            if ([string]::IsNullOrWhiteSpace($upn)) { 
+                return $false 
+            }
+            
+            $isNotBreakGlass = -not $context.bgUpnLookup.ContainsKey($upn.ToLower())
+            if (-not $isNotBreakGlass) { 
+                Write-Verbose "    Filtered out break-glass account: $upn" 
+            }
+            return $isNotBreakGlass
+        }
+        
+        $filteredCount = $filteredPageUsers.Count
+        $removedCount = $pageUsers.Count - $filteredCount
+        if ($removedCount -gt 0) {
+            Write-Verbose "  -> Page $pageNumber : Filtered $($pageUsers.Count) -> $filteredCount users (removed $removedCount break-glass accounts)"
+        }
+        
+        if ($filteredCount -eq 0) {
+            Write-Verbose "  -> Page $pageNumber : No users remaining after filtering, skipping upload..."
+            return @{ ProcessedCount = $pageUsers.Count; UploadedCount = 0 }
+        }
+        
+        # Process current page users
+        $batchResults = $filteredPageUsers | ForEach-Object {
+            $user = $_
+            $registration = $context.regById[$user.id]
+            $methods = @()
+            
+            if ($registration -and $registration.methodsRegistered) {
+                $methods = @($registration.methodsRegistered)
+            }
+            
+            [PSCustomObject]@{
+                id                = $user.id
+                userPrincipalName = $user.userPrincipalName
+                displayName       = $user.displayName
+                mail              = $user.mail
+                createdDateTime   = $user.createdDateTime
+                userType          = $user.userType
+                accountEnabled    = $user.accountEnabled
+                signInActivity    = $user.signInActivity
+                isMfaRegistered       = if ($registration) { $registration.isMfaRegistered } else { $null }
+                isMfaCapable          = if ($registration) { $registration.isMfaCapable } else { $null }
+                isSsprEnabled         = if ($registration) { $registration.isSsprEnabled } else { $null }
+                isSsprRegistered      = if ($registration) { $registration.isSsprRegistered } else { $null }
+                isSsprCapable         = if ($registration) { $registration.isSsprCapable } else { $null }
+                isPasswordlessCapable = if ($registration) { $registration.isPasswordlessCapable } else { $null }
+                defaultMethod         = if ($registration) { $registration.defaultMethod } else { $null }
+                methodsRegistered     = $methods
+                isSystemPreferredAuthenticationMethodEnabled = if ($registration) { $registration.isSystemPreferredAuthenticationMethodEnabled } else { $null }
+                systemPreferredAuthenticationMethods = if ($registration) { $registration.systemPreferredAuthenticationMethods } else { $null }
+                userPreferredMethodForSecondaryAuthentication = if ($registration) { $registration.userPreferredMethodForSecondaryAuthentication } else { $null }
+                ReportTime        = $context.ReportTime
+            }
+        }
+        
+        Write-Verbose "  -> Page $pageNumber : Processing complete. $filteredCount records prepared for upload"        
+        # Upload current page to Log Analytics
+        Write-Verbose "  -> Page $pageNumber : Uploading $($batchResults.Count) records to Log Analytics..."
+        
+        $pageUploadSuccessful = $false
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+                New-LogAnalyticsData -Data $batchResults -WorkSpaceID $context.WorkSpaceID -WorkSpaceKey $context.WorkspaceKey -LogType "GuardrailsUserRaw" | Out-Null
+                $pageUploadSuccessful = $true
+                Write-Verbose "  Success: Page $pageNumber upload successful on attempt $attempt"
+                break
+            }
+            catch {
+                if ($attempt -eq 3) {
+                    $errorMsg = "Failed to upload page $pageNumber after 3 attempts: $($_.Exception.Message)"
+                    Add-FunctionError -Message $errorMsg -Exception $_.Exception -Category "LogAnalytics" -ErrorList $context.ErrorList
+                    throw [System.Exception]::new($errorMsg)
+                } else {
+                    $delay = Get-BackoffDelay -Attempt $attempt -Config $context.RetryConfig
+                    Start-Sleep -Seconds $delay
+                }
+            }
+        }
+        
+        if (-not $pageUploadSuccessful) {
+            $errorMsg = "Failed to upload page $pageNumber after 3 attempts"
+            Add-FunctionError -Message $errorMsg -Category "LogAnalytics" -ErrorList $context.ErrorList
+            throw [System.Exception]::new($errorMsg)
+        }
+        
+        # Progress reporting
+        $statusMsg = if ($hasMore) { "more pages remaining..." } else { "final page" }
+        Write-Verbose "  -> Page $pageNumber : Upload complete ($statusMsg)"
+        
+        return @{ 
+            ProcessedCount = $pageUsers.Count
+            UploadedCount = $batchResults.Count 
+        }
+    }
+    
+    try {
+        # Use true streaming approach with callback processing        
+        $streamResult = Invoke-GraphQueryStreamWithCallback -urlPath $usersPath -PageSize $BatchSize -ProcessPageCallback $processPageCallback -CallbackContext $callbackContext -PerformanceMetrics $performanceMetrics        
+        $pageNumber = $streamResult.TotalPages
+        $processedUsers = $streamResult.TotalProcessed
+        $totalUploadedRecords = $streamResult.TotalUploaded
+                
+        $performanceMetrics.UsersProcessed = $processedUsers
+        Write-Verbose "  Success: All pages processed and uploaded - $totalUploadedRecords total records uploaded from $pageNumber pages"
+        
+    } catch {
+        Add-FunctionError -Message "Failed during streaming user processing" -Exception $_.Exception -Category "GraphAPI" -ErrorList $ErrorList
+        return $ErrorList
+    }
+    
+    # Step 5: Wait before verification to allow data ingestion and table creation
+    Write-Verbose "Step 5: Waiting for data ingestion and table creation..."
+    Write-Verbose "  -> Waiting 60 seconds to allow Log Analytics to create table and index data..."
+    Write-Verbose "  -> Note: First-time table creation can take several minutes in Log Analytics"
+    Start-Sleep -Seconds 60
+    
+    # Step 6: Verify data ingestion with robust error handling
+    Write-Verbose "Step 6: Verifying data ingestion..."
+    
+    $dataIngested = $false
+    $recordCount = 0
+    $permissionError = $false
+    $verificationSkipped = $false
+    
+    # First, check if we can access Log Analytics at all
+    Write-Verbose "  -> Testing Log Analytics connectivity..."
+    try {
+        # Simple test query to check permissions and connectivity
+        $testQuery = "Heartbeat | limit 1"
+        $testResult = Invoke-AzOperationalInsightsQuery -WorkspaceId $WorkSpaceID -Query $testQuery -ErrorAction Stop
+        Write-Verbose "  -> Log Analytics connectivity test successful"
+    }
+    catch {
+        $errorMessage = $_.Exception.Message
+        if ($errorMessage -like "*Forbidden*" -or $errorMessage -like "*403*" -or $errorMessage -like "*unauthorized*") {
+            Write-Verbose "  -> Automation Account may need 'Log Analytics Reader' role on workspace $WorkSpaceID"
+            $permissionError = $true
+            $verificationSkipped = $true
+        }
+        elseif ($errorMessage -like "*BadRequest*" -or $errorMessage -like "*400*" -or $errorMessage -like "*Failed to resolve table*") {
+            Write-Verbose "  -> The GuardrailsUserRaw_CL table may still be initializing after first data upload"
+            Write-Verbose "  -> This typically resolves within 5-15 minutes of first deployment"
+            $verificationSkipped = $true
+        }
+        else {
+            Write-Verbose "  -> Will attempt data verification with reduced retry count"
+        }
+    }
+    
+    # Only attempt verification if connectivity test passed
+    if (-not $verificationSkipped) {
+        $maxVerificationAttempts = [Math]::Min($RetryConfig.MaxRetries, 6)  # Limit to 6 attempts max
+        
+        for ($attempt = 1; $attempt -le $maxVerificationAttempts; $attempt++) {
+        $performanceMetrics.DataIngestionAttempts = $attempt
+            
+            # Use more robust query with error handling
+            $query = @"
+GuardrailsUserRaw_CL 
+| where ReportTime_s == '$ReportTime'
+| count
+"@
+            
+            try {
+                Write-Verbose "  -> Verification attempt $attempt/$maxVerificationAttempts : Querying Log Analytics..."
+                
+                # Use shorter timeout and explicit error handling
+                $result = Invoke-AzOperationalInsightsQuery -WorkspaceId $WorkSpaceID -Query $query -ErrorAction Stop
+                $recordCount = 0
+            
+                if ($result -and $result.Results) {
+                    try {
+                        # Direct access - if Count property exists, this will work
+                        $recordCount = [int]$result.Results[0].Count
+                    } catch {
+                        # If direct access fails, the Count property doesn't exist as expected
+                        $recordCount = 0
+                    }
+                }
+            
+                if ($recordCount -gt 0) {
+                    Write-Verbose "  Success: Data ingestion verified - $recordCount records found for ReportTime '$ReportTime'"
+                    $dataIngested = $true
+                    break
+                } else {
+                    $delay = Get-BackoffDelay -Attempt $attempt -Config $RetryConfig
+                        Write-Verbose "  -> Data not yet available (attempt $attempt/$maxVerificationAttempts). Waiting $delay seconds..."
+                    
+                        if ($attempt -lt $maxVerificationAttempts) {
+                        Start-Sleep -Seconds $delay
+                    }
+                }
+            
+            } catch {
+                $errorMessage = $_.Exception.Message
+                $delay = Get-BackoffDelay -Attempt $attempt -Config $RetryConfig
+                
+                if ($errorMessage -like "*Forbidden*" -or $errorMessage -like "*403*" -or $errorMessage -like "*unauthorized*") {
+                    Write-Warning "  Warning: Permission error on attempt $attempt : $errorMessage"
+                    $permissionError = $true
+                    break  # Don't retry permission errors
+                } 
+                elseif ($errorMessage -like "*BadRequest*" -or $errorMessage -like "*400*" -or $errorMessage -like "*Failed to resolve table*") {
+                    if ($errorMessage -like "*Failed to resolve table*GuardrailsUserRaw_CL*") {
+                        Write-Warning "  Warning: Table GuardrailsUserRaw_CL not yet available in Log Analytics."
+                        Write-Verbose "  -> This is normal for first-time deployments - table creation can take 5-15 minutes"
+                        Write-Verbose "  -> Data was uploaded successfully and will be available once indexing completes"
+                        $verificationSkipped = $true
+                    } else {
+                        Write-Warning "  Warning: Query error on attempt $attempt : $errorMessage"
+                        if ($attempt -eq $maxVerificationAttempts) {
+                            Write-Verbose "  -> Query verification not available in this environment"
+                            $verificationSkipped = $true
+                        }
+                    }
+                    break  # Don't retry bad request errors
+                }
+                else {
+                    Write-Warning "  Warning: Query attempt $attempt failed: $errorMessage"                    
+                    if ($attempt -eq $maxVerificationAttempts) {
+                        Write-Verbose "  -> Maximum verification attempts reached"
+                    } elseif ($attempt -lt $maxVerificationAttempts) {
+                        Write-Verbose "  -> Retrying in $delay seconds..."
+                        Start-Sleep -Seconds $delay
+                    }
+                }
+            }
+        }
+    }
+    
+    # Step 7: Final validation and reporting with graceful error handling
+    Write-Verbose "Step 7: Final validation and reporting..."
+    
+    if ($verificationSkipped) {
+        if ($permissionError) {
+                Write-Warning "  Warning: Data verification skipped due to insufficient Log Analytics permissions."
+                Write-Verbose "  -> Data upload completed successfully: $totalUploadedRecords records uploaded"
+                Write-Verbose "  -> Consider granting 'Log Analytics Reader' role to the Automation Account for verification"
+            } else {
+                Write-Warning "  Warning: Data verification skipped - GuardrailsUserRaw_CL table not yet available."
+                Write-Verbose "  -> Data upload completed successfully: $totalUploadedRecords records uploaded"
+                Write-Verbose "  -> This is normal for first-time deployments - table creation can take 5-15 minutes"
+                Write-Verbose "  -> Subsequent runs will be able to verify data once the table is established"
+            }
+            
+        # Don't treat verification skip as a failure - data was uploaded successfully
+        Write-Verbose "  Success: Data upload completed - $totalUploadedRecords records uploaded to Log Analytics"        
+    } elseif ($permissionError) {
+        # Permission error occurred during verification attempts
+        Write-Warning "  Warning: Cannot verify data ingestion due to permission error."
+        Write-Verbose "  -> Data upload completed: $totalUploadedRecords records uploaded"
+        Write-Verbose "  -> Verification failed, but upload was successful"
+            
+        # Add a non-fatal warning rather than an error
+        Add-FunctionError -Message "Data verification unavailable due to permissions. Upload completed successfully with $totalUploadedRecords records." -Category "Permissions" -ErrorList $ErrorList
+        
+    } elseif (-not $dataIngested) {
+        # Verification was attempted but no data found
+        Write-Warning "  Warning: Data ingestion verification failed - no records found in Log Analytics."
+        Write-Verbose "  -> Uploaded $totalUploadedRecords records but verification query returned 0 results"
+        Write-Verbose "  -> This may indicate data ingestion delay or indexing issues"
+            
+        Add-FunctionError -Message "Data ingestion verification failed. Uploaded $totalUploadedRecords records but verification query found 0 results. Data may still be processing." -Category "DataVerification" -ErrorList $ErrorList        
+    } elseif ($recordCount -ne $totalUploadedRecords) {
+            # Data found but count mismatch
+        $expectedCount = $totalUploadedRecords
+        Write-Warning "  Warning: Data count mismatch detected."
+        Write-Verbose "  -> Expected: $expectedCount records, Found: $recordCount records"
+            
+        if ($recordCount > 0) {
+            Write-Verbose "  -> Partial data ingestion detected - some records may still be processing"
+            Add-FunctionError -Message "Data count mismatch: expected $expectedCount, found $recordCount records. Some data may still be processing." -Category "DataIntegrity" -ErrorList $ErrorList
+        } else {
+            Add-FunctionError -Message "Data count mismatch: expected $expectedCount, found $recordCount records. Data may be missing or still processing." -Category "DataIntegrity" -ErrorList $ErrorList
+        }    
+    } else {
+        # Perfect success case
+        Write-Verbose "  Success: Data ingestion verification successful - $recordCount records ingested and verified"
+        Write-Verbose "  -> Upload and verification both completed successfully"
+    }
+    
+    # Performance summary
+    $stopwatch.Stop()
+    $performanceMetrics.EndTime = Get-Date
+    $performanceMetrics.TotalDurationMs = $stopwatch.ElapsedMilliseconds
+    $performanceMetrics.TotalDurationMin = [Math]::Round($stopwatch.ElapsedMilliseconds / 60000, 2)
+    
+    Write-Verbose "=== Performance Summary ==="
+    $durationMin = $performanceMetrics.TotalDurationMin
+    $durationMs = $performanceMetrics.TotalDurationMs
+    Write-Verbose "  Total Duration: $durationMin minutes ($durationMs ms)"
+    Write-Verbose "  Users Processed: $($performanceMetrics.UsersProcessed)"
+    Write-Verbose "  Records Uploaded: $totalUploadedRecords"
+    Write-Verbose "  Page Size: $BatchSize"
+    Write-Verbose "  Total Pages: $pageNumber"
+    Write-Verbose "  Graph API Calls: $($performanceMetrics.GraphApiCalls)"
+    Write-Verbose "  Data Ingestion Attempts: $($performanceMetrics.DataIngestionAttempts)"
+    Write-Verbose "  Errors: $($ErrorList.Count)"
+    
+    if ($ErrorList.Count -eq 0) {
+        Write-Verbose "  Success: Function completed successfully with no errors!"
+    } else {
+        $errorCount = $ErrorList.Count
+        Write-Verbose "  Warning: Function completed with $errorCount errors/warnings"
+    }
+    
+    Write-Verbose "=== FetchAllUserRawData Complete ==="
+    
+    return $ErrorList
+}

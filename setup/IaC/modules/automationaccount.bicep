@@ -141,7 +141,7 @@ resource guardrailsAC 'Microsoft.Automation/automationAccounts@2021-06-22' = if 
     properties: {
       contentLink: {
         uri: '${ModuleBaseURL}/GR-Common.zip'
-        version: '1.3.4'
+        version: '1.3.7'
       }
     }
   }
@@ -258,7 +258,7 @@ resource guardrailsAC 'Microsoft.Automation/automationAccounts@2021-06-22' = if 
     properties: {
       contentLink: {
         uri: '${ModuleBaseURL}/Check-AllUserMFARequired.zip'
-        version: '1.0.9'
+        version: '1.0.10'
       }
     }
   }
@@ -343,7 +343,7 @@ resource guardrailsAC 'Microsoft.Automation/automationAccounts@2021-06-22' = if 
     properties: {
       contentLink: {
         uri: '${ModuleBaseURL}/Check-RiskBasedAccess.zip'
-        version: '1.0.2'
+        version: '1.0.3'
       }
     }
   }
@@ -373,7 +373,7 @@ resource guardrailsAC 'Microsoft.Automation/automationAccounts@2021-06-22' = if 
     properties: {
       contentLink: {
         uri: '${ModuleBaseURL}/Check-AlertsMonitor.zip'
-        version: '1.0.7'
+        version: '1.0.9'
       }
     }
   }
@@ -433,7 +433,7 @@ resource guardrailsAC 'Microsoft.Automation/automationAccounts@2021-06-22' = if 
     properties: {
       contentLink: {
         uri: '${ModuleBaseURL}/Check-ServiceHealthAlerts.zip'
-        version: '1.0.4'
+        version: '1.0.5'
       }
     }
   }

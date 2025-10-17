@@ -213,11 +213,29 @@ catch {
     Get-ChildItem $messagesBaseDirectory
     break
 }
+
+try {
+    [String] $FirstBreakGlassUPN = Get-AzKeyVaultSecret -VaultName $KeyVaultName -Name 'BGA1' -AsPlainText -ErrorAction Stop
+    [String] $SecondBreakGlassUPN = Get-AzKeyVaultSecret -VaultName $KeyVaultName -Name 'BGA2' -AsPlainText -ErrorAction Stop
+}
+catch {
+    throw "Failed to retrieve breakglass account UPN's from KeyVault '$KeyVaultName'. Error message: $_"
+}
 Write-Output "Loaded $($msgTable.Count) messages." 
+
+Write-Output "Fetching all user raw data."
+# Ingest all user raw data before running modules
+$UserRawDataErrors = FetchAllUserRawData -ReportTime $ReportTime -FirstBreakGlassUPN $FirstBreakGlassUPN -SecondBreakGlassUPN $SecondBreakGlassUPN -WorkSpaceID $WorkSpaceID -WorkspaceKey $WorkspaceKey
+if ($UserRawDataErrors.Count -gt 0) {
+    Write-Error "Errors occurred during user raw data ingestion: $($UserRawDataErrors -join '; ')"
+}
+Write-Output "Fetching user raw data complete."
+
 Write-Output "Starting modules loop."
 $cloudUsageProfilesString = $cloudUsageProfiles -join ','
-
+$moduleCount = 0
 foreach ($module in $modules) {
+    $moduleCount++
     if ($module.Status -eq "Enabled") {
         if($enableMultiCloudProfiles) {
             $module.Script += " -EnableMultiCloudProfiles"
@@ -273,6 +291,22 @@ foreach ($module in $modules) {
             }
 
             Write-Output "Script running is done for $($module.modulename)"
+
+            # Clear memory after each module
+            $results = $null
+            $NewScriptBlock = $null
+            $vars = $null
+            $variables = $null
+            $secrets = $null
+            $localVariables = $null
+            
+            # Force garbage collection every 3 modules
+            if ($moduleCount % 3 -eq 0) {
+                Write-Output "Clearing memory after $moduleCount modules..."
+                [System.GC]::Collect()
+                [System.GC]::WaitForPendingFinalizers()
+                [System.GC]::Collect()
+            }
         }
         catch {
             Write-Output "Caught error while invoking result is $($results.Errors)" 
